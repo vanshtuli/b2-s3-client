@@ -10,6 +10,8 @@ import sys
 import logging
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 import argparse
+import concurrent.futures
+from functools import partial
 
 # Configure logging
 logging.basicConfig(
@@ -335,7 +337,7 @@ class BackblazeB2Client:
             raise ValueError(
                 "Both source and destination are local paths. Use regular file operations instead.")
 
-    def sync(self, source, destination, delete=False, exclude=None, include=None):
+    def sync(self, source, destination, delete=False, exclude=None, include=None, max_workers=4):
         """
         Sync files between local filesystem and Backblaze B2 (similar to AWS sync command).
 
@@ -349,6 +351,7 @@ class BackblazeB2Client:
             delete (bool): Whether to delete files in the destination that don't exist in the source
             exclude (list): Patterns to exclude from syncing
             include (list): Patterns to include in syncing (takes precedence over exclude)
+            max_workers (int): Maximum number of parallel workers for file operations
         """
         if not self.authenticated:
             self.authenticate()
@@ -401,18 +404,44 @@ class BackblazeB2Client:
             'errors': 0
         }
 
+        # Helper function to process a single file upload
+        def process_upload(local_path, remote_path, dest_b, stats):
+            try:
+                logger.info(f"Uploading {local_path} to {remote_path}")
+                file_info = dest_b.upload_local_file(
+                    local_file=local_path,
+                    file_name=remote_path
+                )
+                stats['files_uploaded'] += 1
+                stats['bytes_transferred'] += os.path.getsize(local_path)
+            except Exception as e:
+                logger.error(f"Error uploading {local_path}: {str(e)}")
+                stats['errors'] += 1
+
+        # Helper function to process a single file download
+        def process_download(remote_key, local_path, source_b, stats):
+            try:
+                logger.info(f"Downloading {remote_key} to {local_path}")
+                # Get file info first to get the size
+                file_info = source_b.get_file_info_by_name(remote_key)
+                downloaded_file = source_b.download_file_by_name(remote_key)
+                downloaded_file.save_to(local_path)
+                stats['files_downloaded'] += 1
+                stats['bytes_transferred'] += file_info.size
+            except Exception as e:
+                logger.error(f"Error downloading {remote_key}: {str(e)}")
+                stats['errors'] += 1
+
         # Case 1: Sync from local to B2
         if not source_bucket and dest_bucket:
             # Get the destination bucket
             dest_b = self.api.get_bucket_by_name(dest_bucket)
             if not dest_b:
-                raise ValueError(
-                    f"Destination bucket '{dest_bucket}' not found")
+                raise ValueError(f"Destination bucket '{dest_bucket}' not found")
 
             # Get list of files at destination
             dest_files = {}
-            for file_version, _ in dest_b.ls(folder_to_list=dest_prefix, latest_only=True):
-                # Remove the prefix from the key for comparison
+            for file_version, _ in dest_b.ls(folder_to_list=dest_prefix, recursive=True, latest_only=True):
                 key = file_version.file_name
                 if dest_prefix and key.startswith(dest_prefix):
                     key = key[len(dest_prefix):]
@@ -425,58 +454,40 @@ class BackblazeB2Client:
                     'modified': file_version.upload_timestamp
                 }
 
-            # Walk the source directory
-            for root, _, files in os.walk(source):
-                for file in files:
-                    local_path = os.path.join(root, file)
+            # Process uploads in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for root, _, files in os.walk(source):
+                    for file in files:
+                        local_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(local_path, source)
 
-                    # Skip files that don't match the include/exclude patterns
-                    rel_path = os.path.relpath(local_path, source)
-                    if not should_include(rel_path):
-                        continue
+                        if not should_include(rel_path):
+                            continue
 
-                    # Calculate the remote path
-                    if os.path.sep == '\\':  # Windows
-                        rel_path = rel_path.replace('\\', '/')
+                        if os.path.sep == '\\':  # Windows
+                            rel_path = rel_path.replace('\\', '/')
 
-                    remote_path = f"{dest_prefix}/{rel_path}" if dest_prefix else rel_path
-                    remote_path = remote_path.lstrip('/')
+                        remote_path = f"{dest_prefix}/{rel_path}" if dest_prefix else rel_path
+                        remote_path = remote_path.lstrip('/')
 
-                    # Check if we need to upload the file
-                    local_modified = os.path.getmtime(
-                        local_path) * 1000  # Convert to milliseconds
-                    local_size = os.path.getsize(local_path)
+                        local_size = os.path.getsize(local_path)
+                        should_upload = True
+                        if rel_path in dest_files:
+                            if dest_files[rel_path]['size'] == local_size:
+                                should_upload = False
 
-                    should_upload = True
-                    if rel_path in dest_files:
-                        # File exists at destination, check if it needs updating
-                        if dest_files[rel_path]['size'] == local_size:
-                            # File has same size, skip upload
-                            # Note: B2 doesn't provide a modification time we can reliably compare
-                            # with local files, so we use size as a heuristic
-                            should_upload = False
+                        if should_upload:
+                            futures.append(executor.submit(
+                                process_upload, local_path, remote_path, dest_b, stats))
 
-                    if should_upload:
-                        try:
-                            # Upload the file
-                            logger.info(
-                                f"Uploading {local_path} to {remote_path}")
-                            file_info = dest_b.upload_local_file(
-                                local_file=local_path,
-                                file_name=remote_path
-                            )
-                            stats['files_uploaded'] += 1
-                            stats['bytes_transferred'] += local_size
-                        except Exception as e:
-                            logger.error(
-                                f"Error uploading {local_path}: {str(e)}")
-                            stats['errors'] += 1
+                # Wait for all uploads to complete
+                concurrent.futures.wait(futures)
 
-            # Delete files at destination that don't exist in source
+            # Process deletions
             if delete:
                 for key, info in dest_files.items():
-                    local_path = os.path.join(
-                        source, key.replace('/', os.path.sep))
+                    local_path = os.path.join(source, key.replace('/', os.path.sep))
                     if not os.path.exists(local_path) and should_include(key):
                         try:
                             logger.info(f"Deleting {key} from B2")
@@ -497,16 +508,13 @@ class BackblazeB2Client:
             if not os.path.exists(destination):
                 os.makedirs(destination)
 
-            # Get list of files in the source bucket with the given prefix
+            # Get list of files in the source bucket
             source_files = {}
-            for file_version, _ in source_b.ls(folder_to_list=source_prefix, latest_only=True):
+            for file_version, _ in source_b.ls(folder_to_list=source_prefix, recursive=True, latest_only=True):
                 key = file_version.file_name
-
-                # Skip files that don't match the include/exclude patterns
                 if not should_include(key):
                     continue
 
-                # Remove the prefix from the key for comparison
                 if source_prefix and key.startswith(source_prefix):
                     rel_key = key[len(source_prefix):]
                     if rel_key.startswith('/'):
@@ -521,81 +529,61 @@ class BackblazeB2Client:
                     'modified': file_version.upload_timestamp
                 }
 
-            # Download files from B2 to local
-            for rel_key, info in source_files.items():
-                local_path = os.path.join(
-                    destination, rel_key.replace('/', os.path.sep))
+            # Process downloads in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for rel_key, info in source_files.items():
+                    local_path = os.path.join(destination, rel_key.replace('/', os.path.sep))
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
-                # Create parent directories if they don't exist
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    should_download = True
+                    if os.path.exists(local_path):
+                        local_size = os.path.getsize(local_path)
+                        if local_size == info['size']:
+                            should_download = False
 
-                should_download = True
-                if os.path.exists(local_path):
-                    # File exists locally, check if it needs updating
-                    local_size = os.path.getsize(local_path)
-                    if local_size == info['size']:
-                        # File has same size, skip download
-                        should_download = False
+                    if should_download:
+                        futures.append(executor.submit(
+                            process_download, info['remote_key'], local_path, source_b, stats))
 
-                if should_download:
-                    try:
-                        logger.info(
-                            f"Downloading {info['remote_key']} to {local_path}")
-                        downloaded_file = source_b.download_file_by_name(
-                            info['remote_key'])
-                        downloaded_file.save_to(local_path)
-                        stats['files_downloaded'] += 1
-                        stats['bytes_transferred'] += info['size']
-                    except Exception as e:
-                        logger.error(
-                            f"Error downloading {info['remote_key']}: {str(e)}")
-                        stats['errors'] += 1
+                # Wait for all downloads to complete
+                concurrent.futures.wait(futures)
 
-            # Delete local files that don't exist in B2
+            # Process deletions
             if delete:
                 for root, _, files in os.walk(destination):
                     for file in files:
                         local_path = os.path.join(root, file)
                         rel_path = os.path.relpath(local_path, destination)
-
-                        # Convert to use forward slashes for comparison with B2 keys
                         if os.path.sep == '\\':  # Windows
                             rel_path = rel_path.replace('\\', '/')
-
                         if rel_path not in source_files and should_include(rel_path):
                             try:
-                                logger.info(
-                                    f"Deleting local file {local_path}")
+                                logger.info(f"Deleting local file {local_path}")
                                 os.remove(local_path)
                                 stats['files_deleted'] += 1
                             except Exception as e:
-                                logger.error(
-                                    f"Error deleting {local_path}: {str(e)}")
+                                logger.error(f"Error deleting {local_path}: {str(e)}")
                                 stats['errors'] += 1
 
         # Case 3: B2 to B2 sync
         elif source_bucket and dest_bucket:
-            # Get the source bucket
+            # Get the source and destination buckets
             source_b = self.api.get_bucket_by_name(source_bucket)
-            if not source_b:
-                raise ValueError(f"Source bucket '{source_bucket}' not found")
-
-            # Get the destination bucket
             dest_b = self.api.get_bucket_by_name(dest_bucket)
-            if not dest_b:
-                raise ValueError(
-                    f"Destination bucket '{dest_bucket}' not found")
+            if not source_b or not dest_b:
+                raise ValueError("Source or destination bucket not found")
 
-            # Get list of files in the source bucket with the given prefix
+            # Get list of files in both buckets
             source_files = {}
-            for file_version, _ in source_b.ls(folder_to_list=source_prefix, latest_only=True):
+            dest_files = {}
+            
+            # Process source files
+            for file_version, _ in source_b.ls(folder_to_list=source_prefix, recursive=True, latest_only=True):
                 key = file_version.file_name
-
-                # Skip files that don't match the include/exclude patterns
                 if not should_include(key):
                     continue
 
-                # Remove the prefix from the key for comparison
                 if source_prefix and key.startswith(source_prefix):
                     rel_key = key[len(source_prefix):]
                     if rel_key.startswith('/'):
@@ -610,12 +598,9 @@ class BackblazeB2Client:
                     'modified': file_version.upload_timestamp
                 }
 
-            # Get list of files at destination
-            dest_files = {}
-            for file_version, _ in dest_b.ls(folder_to_list=dest_prefix, latest_only=True):
+            # Process destination files
+            for file_version, _ in dest_b.ls(folder_to_list=dest_prefix, recursive=True, latest_only=True):
                 key = file_version.file_name
-
-                # Remove the prefix from the key for comparison
                 if dest_prefix and key.startswith(dest_prefix):
                     rel_key = key[len(dest_prefix):]
                     if rel_key.startswith('/'):
@@ -630,53 +615,46 @@ class BackblazeB2Client:
                     'modified': file_version.upload_timestamp
                 }
 
-            # Copy files from source to destination
-            for rel_key, source_info in source_files.items():
-                dest_key = f"{dest_prefix}/{rel_key}" if dest_prefix else rel_key
-                dest_key = dest_key.lstrip('/')
+            # Process copies in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for rel_key, source_info in source_files.items():
+                    dest_key = f"{dest_prefix}/{rel_key}" if dest_prefix else rel_key
+                    dest_key = dest_key.lstrip('/')
 
-                should_copy = True
-                if rel_key in dest_files:
-                    # File exists at destination, check if it needs updating
-                    if dest_files[rel_key]['size'] == source_info['size']:
-                        # File has same size, skip copy
-                        should_copy = False
+                    should_copy = True
+                    if rel_key in dest_files:
+                        if dest_files[rel_key]['size'] == source_info['size']:
+                            should_copy = False
 
-                if should_copy:
-                    try:
-                        logger.info(
-                            f"Copying {source_info['remote_key']} to {dest_key}")
-                        file_info = dest_b.copy(
-                            source_bucket_id=source_b.id_,
-                            source_file_name=source_info['remote_key'],
-                            file_name=dest_key
-                        )
+                    if should_copy:
+                        futures.append(executor.submit(
+                            lambda: dest_b.copy(
+                                source_bucket_id=source_b.id_,
+                                source_file_name=source_info['remote_key'],
+                                file_name=dest_key
+                            )))
                         stats['files_uploaded'] += 1
                         stats['bytes_transferred'] += source_info['size']
-                    except Exception as e:
-                        logger.error(
-                            f"Error copying {source_info['remote_key']}: {str(e)}")
-                        stats['errors'] += 1
 
-            # Delete files at destination that don't exist in source
+                # Wait for all copies to complete
+                concurrent.futures.wait(futures)
+
+            # Process deletions
             if delete:
                 for rel_key, info in dest_files.items():
                     if rel_key not in source_files and should_include(rel_key):
                         try:
-                            logger.info(
-                                f"Deleting {info['remote_key']} from B2")
-                            dest_b.delete_file_version(
-                                info['id'], info['remote_key'])
+                            logger.info(f"Deleting {info['remote_key']} from B2")
+                            dest_b.delete_file_version(info['id'], info['remote_key'])
                             stats['files_deleted'] += 1
                         except Exception as e:
-                            logger.error(
-                                f"Error deleting {info['remote_key']}: {str(e)}")
+                            logger.error(f"Error deleting {info['remote_key']}: {str(e)}")
                             stats['errors'] += 1
 
         # Case 4: Local to local sync (not supported)
         else:
-            raise ValueError(
-                "Both source and destination are local paths. Use regular file operations instead.")
+            raise ValueError("Both source and destination are local paths. Use regular file operations instead.")
 
         logger.info(f"Sync completed: {stats}")
 
@@ -684,8 +662,7 @@ class BackblazeB2Client:
         print(f"  Files uploaded: {stats['files_uploaded']}")
         print(f"  Files downloaded: {stats['files_downloaded']}")
         print(f"  Files deleted: {stats['files_deleted']}")
-        print(
-            f"  Bytes transferred: {stats['bytes_transferred'] / (1024 * 1024):.2f} MB")
+        print(f"  Bytes transferred: {stats['bytes_transferred'] / (1024 * 1024):.2f} MB")
 
         if stats['errors'] > 0:
             print(f"  Errors: {stats['errors']} (check logs for details)")
@@ -723,3 +700,12 @@ class BackblazeB2Client:
             print("\nAvailable buckets:")
             for bucket in buckets:
                 print(f"- {bucket.name}")
+
+
+if __name__ == "__main__":
+    client = BackblazeB2Client(
+        application_key_id='0056330f53105c10000000001',
+        application_key='K005+8GT9BYpCDbBHsT47OQrewGy+sE'
+    )
+
+    client.sync("b2://iqfeed/futures/cmemini/ES", "es")
