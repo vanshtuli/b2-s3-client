@@ -701,11 +701,3 @@ class BackblazeB2Client:
             for bucket in buckets:
                 print(f"- {bucket.name}")
 
-
-if __name__ == "__main__":
-    client = BackblazeB2Client(
-        application_key_id='0056330f53105c10000000001',
-        application_key='K005+8GT9BYpCDbBHsT47OQrewGy+sE'
-    )
-
-    client.sync("b2://iqfeed/futures/cmemini/ES", "es")
